@@ -47,36 +47,60 @@ async function initDb() {
         contact_person TEXT,
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
-      -- refresh_tokens table retained only if already exists; no longer used
+
+      CREATE TABLE IF NOT EXISTS guardian_access(
+        guardian_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        request_id UUID REFERENCES track_requests(id),
+        granted_at TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (guardian_id, user_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS locations(
+        id BIGSERIAL PRIMARY KEY,
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        lat DOUBLE PRECISION,
+        lng DOUBLE PRECISION,
+        accuracy DOUBLE PRECISION,
+        recorded_at TIMESTAMPTZ DEFAULT NOW(),
+        link TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS track_requests(
+        id UUID PRIMARY KEY,
+        guardian_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        target_user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','denied')),
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS sos(
+        id UUID PRIMARY KEY,
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        note TEXT,
+        emergency_type TEXT,
+        active BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        resolved_at TIMESTAMPTZ
+      );
+
+      CREATE TABLE IF NOT EXISTS doctors(
+        id UUID PRIMARY KEY,
+        ngo_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        phone TEXT,
+        specialty TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
     `);
-    // --- schema migration for existing older users table ---
+
+    // safe alterations for upgrades
     await client.query(`
-      ALTER TABLE users
-        ADD COLUMN IF NOT EXISTS dob DATE,
-        ADD COLUMN IF NOT EXISTS phone TEXT,
-        ADD COLUMN IF NOT EXISTS address TEXT,
-        ADD COLUMN IF NOT EXISTS blood_group TEXT,
-        ADD COLUMN IF NOT EXISTS emergency_info TEXT,
-        ADD COLUMN IF NOT EXISTS org_name TEXT,
-        ADD COLUMN IF NOT EXISTS contact_person TEXT;
+      ALTER TABLE guardian_access ADD COLUMN IF NOT EXISTS request_id UUID REFERENCES track_requests(id);
+      ALTER TABLE track_requests ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
     `);
-    await client.query(`
-      -- Ensure all location columns exist (idempotent)
-      ALTER TABLE locations
-        ADD COLUMN IF NOT EXISTS lat DOUBLE PRECISION,
-        ADD COLUMN IF NOT EXISTS lng DOUBLE PRECISION,
-        ADD COLUMN IF NOT EXISTS accuracy DOUBLE PRECISION,
-        ADD COLUMN IF NOT EXISTS link TEXT;
-      ALTER TABLE locations
-        ALTER COLUMN lat DROP NOT NULL,
-        ALTER COLUMN lng DROP NOT NULL,
-        ALTER COLUMN link DROP NOT NULL;
-    `);
-    await client.query(`
-      -- Add request_id to guardian_access to link approval with original request
-      ALTER TABLE guardian_access
-        ADD COLUMN IF NOT EXISTS request_id UUID REFERENCES track_requests(id);
-    `);
+
     console.log("DB schema initialized");
   } finally {
     client.release();
@@ -89,7 +113,6 @@ initDb().catch((e) => {
 
 // --- JWT Helpers ---
 function signAccessToken(user) {
-  // Single long-lived token (30 days)
   return jwt.sign({ sub: user.id, role: user.role }, process.env.JWT_SECRET, {
     expiresIn: "30d",
   });
@@ -174,7 +197,138 @@ app.post("/auth/sign-in", async (req, res) => {
   });
 });
 
-// Profile (augment to include track requests for users)
+// Lookup email → user ID for guardian
+app.get(
+  "/users/lookup/email/:email",
+  auth(),
+  requireRole("guardian"),
+  async (req, res) => {
+    const email = req.params.email.toLowerCase();
+    const r = await pool.query(
+      "SELECT id,email,name FROM users WHERE lower(email)=$1",
+      [email]
+    );
+    if (!r.rowCount) return res.status(404).json({ error: "not_found" });
+    res.json(r.rows[0]);
+  }
+);
+
+// Guardian creates track request
+app.post(
+  "/guardian/track-request",
+  auth(),
+  requireRole("guardian"),
+  async (req, res) => {
+    const { targetUserId, targetEmail } = req.body || {};
+    let resolvedTargetId = targetUserId || null;
+
+    if (!resolvedTargetId && targetEmail) {
+      const q = await pool.query(
+        "SELECT id FROM users WHERE lower(email)=lower($1)",
+        [targetEmail]
+      );
+      if (!q.rowCount)
+        return res.status(404).json({ error: "target_not_found" });
+      resolvedTargetId = q.rows[0].id;
+    }
+
+    if (!resolvedTargetId)
+      return res
+        .status(400)
+        .json({ error: "provide targetUserId or targetEmail" });
+
+    if (resolvedTargetId === req.user.id)
+      return res.status(400).json({ error: "cannot_request_self" });
+
+    // Only one request ever
+    const existing = await pool.query(
+      "SELECT id,status FROM track_requests WHERE guardian_id=$1 AND target_user_id=$2 LIMIT 1",
+      [req.user.id, resolvedTargetId]
+    );
+    if (existing.rowCount)
+      return res
+        .status(409)
+        .json({ error: "request_already_exists", request: existing.rows[0] });
+
+    const id = uuid();
+    await pool.query(
+      "INSERT INTO track_requests(id,guardian_id,target_user_id) VALUES($1,$2,$3)",
+      [id, req.user.id, resolvedTargetId]
+    );
+    res.status(201).json({ id, status: "pending" });
+  }
+);
+
+// User: list incoming track requests
+app.get(
+  "/user/track-requests",
+  auth(),
+  requireRole("user"),
+  async (req, res) => {
+    const r = await pool.query(
+      `SELECT tr.id, tr.status, tr.created_at,
+            tr.guardian_id,
+            g.name AS guardian_name,
+            g.email AS guardian_email
+       FROM track_requests tr
+       JOIN users g ON g.id = tr.guardian_id
+      WHERE tr.target_user_id = $1
+      ORDER BY tr.created_at DESC`,
+      [req.user.id]
+    );
+    res.json(
+      r.rows.map((row) => ({
+        id: row.id,
+        status: row.status,
+        created_at: row.created_at,
+        guardian: {
+          id: row.guardian_id,
+          name: row.guardian_name,
+          email: row.guardian_email,
+        },
+      }))
+    );
+  }
+);
+
+// User approves/rejects a track request
+app.put(
+  "/user/track-request/:id",
+  auth(),
+  requireRole("user"),
+  async (req, res) => {
+    const { action } = req.body;
+    const requestId = req.params.id;
+
+    if (!["approve", "reject"].includes(action))
+      return res.status(400).json({ error: "invalid action" });
+
+    const r = await pool.query(
+      "SELECT * FROM track_requests WHERE id=$1 AND target_user_id=$2",
+      [requestId, req.user.id]
+    );
+    if (!r.rowCount)
+      return res.status(404).json({ error: "request_not_found" });
+
+    const newStatus = action === "approve" ? "approved" : "denied";
+
+    await pool.query(
+      "UPDATE track_requests SET status=$1, updated_at=NOW() WHERE id=$2",
+      [newStatus, requestId]
+    );
+
+    if (newStatus === "approved") {
+      await pool.query(
+        "INSERT INTO guardian_access(guardian_id,user_id,request_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",
+        [r.rows[0].guardian_id, req.user.id, requestId]
+      );
+    }
+
+    res.json({ id: requestId, status: newStatus });
+  }
+);
+
+// User profile
 app.get("/profile/me", auth(), async (req, res) => {
   const r = await pool.query(
     "SELECT id,name,email,role,dob,address,blood_group,emergency_info FROM users WHERE id=$1",
@@ -207,204 +361,7 @@ app.get("/profile/me", auth(), async (req, res) => {
   }
   res.json(profile);
 });
-app.put("/profile/me", auth(), async (req, res) => {
-  const { dob, address, blood_group, emergency_info } = req.body;
-  await pool.query(
-    "UPDATE users SET dob=COALESCE($2,dob), address=COALESCE($3,address), blood_group=COALESCE($4,blood_group), emergency_info=COALESCE($5,emergency_info) WHERE id=$1",
-    [req.user.id, dob, address, blood_group, emergency_info]
-  );
-  const updated = await pool.query(
-    "SELECT id,name,email,role,dob,address,blood_group,emergency_info FROM users WHERE id=$1",
-    [req.user.id]
-  );
-  res.json(updated.rows[0]);
-});
 
-// Email lookup (guardian/admin/ngo/user -> resolve email to user id)
-app.get("/users/lookup/email/:email", auth(), async (req, res) => {
-  // Any authenticated role can look up; restrict if needed later
-  const email = req.params.email.toLowerCase();
-  const r = await pool.query(
-    "SELECT id,name,email,role FROM users WHERE lower(email)=$1",
-    [email]
-  );
-  if (!r.rowCount) return res.status(404).json({ error: "not_found" });
-  res.json(r.rows[0]);
-});
-
-// Guardian creates track request (now supports targetEmail)
-app.post(
-  "/guardian/track-request",
-  auth(),
-  requireRole("guardian"),
-  async (req, res) => {
-    const { targetUserId, targetEmail } = req.body || {};
-    let resolvedTargetId = targetUserId || null;
-
-    if (!resolvedTargetId && targetEmail) {
-      const q = await pool.query(
-        "SELECT id, role FROM users WHERE lower(email)=lower($1)",
-        [targetEmail]
-      );
-      if (!q.rowCount)
-        return res.status(404).json({ error: "target_not_found" });
-      resolvedTargetId = q.rows[0].id;
-    }
-
-    if (!resolvedTargetId)
-      return res
-        .status(400)
-        .json({ error: "provide targetUserId or targetEmail" });
-    if (resolvedTargetId === req.user.id)
-      return res.status(400).json({ error: "cannot_request_self" });
-
-    // Prevent duplicate pending request
-    const dup = await pool.query(
-      "SELECT 1 FROM track_requests WHERE guardian_id=$1 AND target_user_id=$2 AND status='pending'",
-      [req.user.id, resolvedTargetId]
-    );
-    if (dup.rowCount) return res.status(409).json({ error: "already_pending" });
-
-    const id = uuid();
-    await pool.query(
-      "INSERT INTO track_requests(id,guardian_id,target_user_id) VALUES($1,$2,$3)",
-      [id, req.user.id, resolvedTargetId]
-    );
-    res.status(201).json({ id, status: "pending" });
-  }
-);
-
-// User: list incoming track requests (all)
-app.get(
-  "/user/track-requests",
-  auth(),
-  requireRole("user"),
-  async (req, res) => {
-    const r = await pool.query(
-      `SELECT tr.id, tr.status, tr.created_at,
-              tr.guardian_id,
-              g.name AS guardian_name,
-              g.email AS guardian_email
-         FROM track_requests tr
-         JOIN users g ON g.id = tr.guardian_id
-        WHERE tr.target_user_id = $1
-        ORDER BY tr.created_at DESC`,
-      [req.user.id]
-    );
-    res.json(
-      r.rows.map((row) => ({
-        id: row.id,
-        status: row.status,
-        created_at: row.created_at,
-        guardian: {
-          id: row.guardian_id,
-          name: row.guardian_name,
-          email: row.guardian_email,
-        },
-      }))
-    );
-  }
-);
-
-// SOS
-app.post("/sos", auth(), requireRole("user"), async (req, res) => {
-  const { note, emergency_type } = req.body;
-  const id = uuid();
-  await pool.query(
-    "INSERT INTO sos(id,user_id,note,emergency_type) VALUES($1,$2,$3,$4)",
-    [id, req.user.id, note, emergency_type]
-  );
-  res.status(201).json({ id, active: true });
-});
-app.get("/sos/:id", auth(), async (req, res) => {
-  const r = await pool.query("SELECT * FROM sos WHERE id=$1", [req.params.id]);
-  if (!r.rowCount) return res.status(404).json({ error: "not found" });
-  res.json(r.rows[0]);
-});
-
-// NGOs & Doctors
-app.post("/doctors", auth(), requireRole("ngo"), async (req, res) => {
-  const { name, phone, specialty } = req.body;
-  const id = uuid();
-  await pool.query(
-    "INSERT INTO doctors(id,ngo_id,name,phone,specialty) VALUES($1,$2,$3,$4,$5)",
-    [id, req.user.id, name, phone, specialty]
-  );
-  res.status(201).json({ id });
-});
-
-// Visibility endpoints
-app.get("/profile/me/visible-to", auth(), async (req, res) => {
-  if (req.user.role !== "user") return res.json({ visibleTo: [] });
-  const r = await pool.query(
-    "SELECT guardian_id FROM guardian_access WHERE user_id=$1",
-    [req.user.id]
-  );
-  res.json({ visibleTo: r.rows.map((x) => x.guardian_id) });
-});
-app.get(
-  "/profile/me/access-to",
-  auth(),
-  requireRole("guardian", "ngo"),
-  async (req, res) => {
-    if (req.user.role === "guardian") {
-      const r = await pool.query(
-        "SELECT user_id FROM guardian_access WHERE guardian_id=$1",
-        [req.user.id]
-      );
-      res.json({ canAccess: r.rows.map((x) => x.user_id) });
-    } else res.json({ canAccess: [] });
-  }
-);
-
-
-// SOS
-app.post("/sos", auth(), requireRole("user"), async (req, res) => {
-  const { note, emergency_type } = req.body;
-  const id = uuid();
-  await pool.query(
-    "INSERT INTO sos(id,user_id,note,emergency_type) VALUES($1,$2,$3,$4)",
-    [id, req.user.id, note, emergency_type]
-  );
-  res.status(201).json({ id, active: true });
-});
-app.get("/sos/:id", auth(), async (req, res) => {
-  const r = await pool.query("SELECT * FROM sos WHERE id=$1", [req.params.id]);
-  if (!r.rowCount) return res.status(404).json({ error: "not found" });
-  res.json(r.rows[0]);
-});
-
-// NGOs & Doctors
-app.post("/doctors", auth(), requireRole("ngo"), async (req, res) => {
-  const { name, phone, specialty } = req.body;
-  const id = uuid();
-  await pool.query(
-    "INSERT INTO doctors(id,ngo_id,name,phone,specialty) VALUES($1,$2,$3,$4,$5)",
-    [id, req.user.id, name, phone, specialty]
-  );
-  res.status(201).json({ id });
-});
-
-// Visibility endpoints
-app.get("/profile/me/visible-to", auth(), async (req, res) => {
-  if (req.user.role !== "user") return res.json({ visibleTo: [] });
-  const r = await pool.query(
-    "SELECT guardian_id FROM guardian_access WHERE user_id=$1",
-    [req.user.id]
-  );
-  res.json({ visibleTo: r.rows.map((x) => x.guardian_id) });
-});
-app.get(
-  "/profile/me/access-to",
-  auth(),
-  requireRole("guardian", "ngo"),
-  async (req, res) => {
-    if (req.user.role === "guardian") {
-      const r = await pool.query(
-        "SELECT user_id FROM guardian_access WHERE guardian_id=$1",
-        [req.user.id]
-      );
-      res.json({ canAccess: r.rows.map((x) => x.user_id) });
-    } else res.json({ canAccess: [] });
-  }
-);
+// Start server
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log(`Server listening on ${port}`));

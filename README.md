@@ -338,12 +338,170 @@ curl $BASE/health
 curl $BASE/version
 ```
 
-### Notes
+### Newly Added Endpoints (Tracking Enhancements)
 
-- Replace <userId>, <guardianId>, <ngoId>, <requestId>, <contactId> with real IDs from prior responses.
-- jq is used for parsing JSON (install if missing) or inspect raw output.
-- 401 = invalid/missing token; 403 = role/authorization denied.
-- Re-run location POST several times before history queries.
+### 1. Resolve User By Email
+
+GET /users/lookup/email/:email  
+Purpose: Convert a known email to internal user id (guardian / any authenticated role).
+
+Curl:
+
+```
+curl -H "Authorization: Bearer $GUARDIAN_TOKEN" \
+  "$BASE/users/lookup/email/alice@example.com"
+```
+
+Demo response:
+
+```json
+{
+  "id": "5e4c2c6b-3b1d-4a54-9d8f-2f0b6b2b9f11",
+  "name": "Alice",
+  "email": "alice@example.com",
+  "role": "user"
+}
+```
+
+### 2. Create Track Request (Now supports targetEmail)
+
+POST /guardian/track-request  
+Body accepts either targetUserId or targetEmail.
+
+Curl with email (preferred – no need to know userId):
+
+```
+curl -X POST $BASE/guardian/track-request \
+  -H "Authorization: Bearer $GUARDIAN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"targetEmail":"alice@example.com"}'
+```
+
+Curl with direct user id:
+
+```
+curl -X POST $BASE/guardian/track-request \
+  -H "Authorization: Bearer $GUARDIAN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"targetUserId":"5e4c2c6b-3b1d-4a54-9d8f-2f0b6b2b9f11"}'
+```
+
+Demo response:
+
+```json
+{
+  "id": "9c55b1b4-0c6d-4c2a-9e5f-1a2bb4c9d120",
+  "status": "pending"
+}
+```
+
+Errors:
+
+- 404 target_not_found
+- 409 already_pending
+- 400 cannot_request_self / provide targetUserId or targetEmail
+
+### 3. List Incoming Track Requests (User dashboard)
+
+GET /user/track-requests (user role)  
+Shows all requests (pending, approved, denied) with guardian info.
+
+Curl:
+
+```
+curl -H "Authorization: Bearer $USER_TOKEN" $BASE/user/track-requests
+```
+
+Demo response:
+
+```json
+[
+  {
+    "id": "9c55b1b4-0c6d-4c2a-9e5f-1a2bb4c9d120",
+    "status": "pending",
+    "created_at": "2025-09-25T21:05:10.123Z",
+    "guardian": {
+      "id": "c8422b76-8e6f-4d83-915d-0e4c1fb0d901",
+      "name": "Guardian Gabe",
+      "email": "gabe@example.com"
+    }
+  },
+  {
+    "id": "2fe18f5d-7a31-4fa9-85a9-6b5dd0f5b7b2",
+    "status": "approved",
+    "created_at": "2025-09-24T14:11:37.900Z",
+    "guardian": {
+      "id": "c8422b76-8e6f-4d83-915d-0e4c1fb0d901",
+      "name": "Guardian Gabe",
+      "email": "gabe@example.com"
+    }
+  }
+]
+```
+
+### 4. Approve / Deny Track Request (stores linkage)
+
+POST /user/track-request/:requestId/respond  
+Body: {"approved": true} or {"approved": false}
+
+Curl approve:
+
+```
+curl -X POST $BASE/user/track-request/9c55b1b4-0c6d-4c2a-9e5f-1a2bb4c9d120/respond \
+  -H "Authorization: Bearer $USER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"approved":true}'
+```
+
+Demo response:
+
+```json
+{ "status": "approved" }
+```
+
+On approval guardian_access row includes request_id.
+
+### 5. Extended /profile/me (Users Only: trackRequests embedded)
+
+GET /profile/me
+
+Curl:
+
+```
+curl -H "Authorization: Bearer $USER_TOKEN" $BASE/profile/me
+```
+
+Demo response (truncated):
+
+```json
+{
+  "id": "5e4c2c6b-3b1d-4a54-9d8f-2f0b6b2b9f11",
+  "name": "Alice",
+  "email": "alice@example.com",
+  "role": "user",
+  "trackRequests": [
+    {
+      "id": "9c55b1b4-0c6d-4c2a-9e5f-1a2bb4c9d120",
+      "status": "pending",
+      "created_at": "2025-09-25T21:05:10.123Z",
+      "guardian": {
+        "id": "c8422b76-8e6f-4d83-915d-0e4c1fb0d901",
+        "name": "Guardian Gabe",
+        "email": "gabe@example.com"
+      }
+    }
+  ]
+}
+```
+
+### Summary of Changes
+
+- Added GET /users/lookup/email/:email
+- Enhanced POST /guardian/track-request to accept targetEmail
+- Added GET /user/track-requests
+- Approval now links request -> guardian_access (request_id column)
+- /profile/me returns trackRequests for users
+- Single 30‑day token (no refresh flow)
 
 ## Notes / TODO
 
@@ -358,3 +516,14 @@ curl $BASE/version
 ## License
 
 Proprietary / TBD
+
+### Guardian Tracking Rule (Updated)
+
+A guardian can create only ONE track request per user (lifetime). If a request already exists (pending / approved / denied), attempting another returns:
+
+```
+409 {
+  "error":"request_already_exists",
+  "request":{"id":"<id>","status":"approved"}
+}
+```
