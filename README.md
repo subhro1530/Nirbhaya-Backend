@@ -85,8 +85,6 @@ npm run dev
 Auth:
 POST /auth/sign-up
 POST /auth/sign-in
-POST /auth/refresh
-POST /auth/logout
 
 Profile & Users:
 GET /profile/me
@@ -148,40 +146,14 @@ curl $BASE/health
 curl $BASE/version
 ```
 
-### 2. Auth Flow
+### 2. Auth Flow (Updated single token)
 
-Sign up (user / guardian / ngo):
-
-```
-curl -X POST $BASE/auth/sign-up -H "Content-Type: application/json" -d '{"name":"Alice","email":"alice@example.com","password":"Pass123!","role":"user"}'
-curl -X POST $BASE/auth/sign-up -H "Content-Type: application/json" -d '{"name":"Gabe","email":"gabe@example.com","password":"Pass123!","role":"guardian"}'
-curl -X POST $BASE/auth/sign-up -H "Content-Type: application/json" -d '{"name":"Helping Org","email":"ngo@example.com","password":"Pass123!","role":"ngo"}'
-```
-
-Sign in (store tokens):
+Sign in:
 
 ```
 resp=$(curl -s -X POST $BASE/auth/sign-in -H "Content-Type: application/json" -d '{"email":"alice@example.com","password":"Pass123!"}')
-export USER_ACCESS=$(echo $resp | jq -r '.accessToken')
-export USER_REFRESH=$(echo $resp | jq -r '.refreshToken')
-
-resp=$(curl -s -X POST $BASE/auth/sign-in -H "Content-Type: application/json" -d '{"email":"gabe@example.com","password":"Pass123!"}')
-export GUARDIAN_ACCESS=$(echo $resp | jq -r '.accessToken')
-
-resp=$(curl -s -X POST $BASE/auth/sign-in -H "Content-Type: application/json" -d '{"email":"ngo@example.com","password":"Pass123!"}')
-export NGO_ACCESS=$(echo $resp | jq -r '.accessToken')
-```
-
-Refresh:
-
-```
-curl -X POST $BASE/auth/refresh -H "Content-Type: application/json" -d "{\"refreshToken\":\"$USER_REFRESH\"}"
-```
-
-Logout:
-
-```
-curl -X POST $BASE/auth/logout -H "Authorization: Bearer $USER_ACCESS" -H "Content-Type: application/json" -d "{\"refreshToken\":\"$USER_REFRESH\"}"
+export USER_TOKEN=$(echo $resp | jq -r '.accessToken')
+curl -H "Authorization: Bearer $USER_TOKEN" $BASE/profile/me
 ```
 
 ### 3. Profile
@@ -499,6 +471,35 @@ Demo response (truncated):
 - Added GET /users/lookup/email/:email
 - Enhanced POST /guardian/track-request to accept targetEmail
 - Added GET /user/track-requests
+- Approval now links request -> guardian_access (request_id column)
+- /profile/me returns trackRequests for users
+- Single 30‑day token (no refresh flow)
+
+## Notes / TODO
+
+- Add structured validation (express-validator / zod).
+- Add NGO verification column.
+- Implement notifications (email / push / SMS).
+- Geospatial indexing (PostGIS) for accurate nearby queries.
+- Rate limiting & audit logging.
+- Revocation list cleanup job.
+- Add migrations tool (e.g., node-pg-migrate).
+
+## License
+
+Proprietary / TBD
+
+### Guardian Tracking Rule (Updated)
+
+A guardian can create only ONE track request per user (lifetime). If a request already exists (pending / approved / denied), attempting another returns:
+
+```
+409 {
+  "error":"request_already_exists",
+  "request":{"id":"<id>","status":"approved"}
+}
+```
+
 - Approval now links request -> guardian_access (request_id column)
 - /profile/me returns trackRequests for users
 - Single 30‑day token (no refresh flow)

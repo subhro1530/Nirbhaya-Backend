@@ -27,6 +27,16 @@ const pool = new Pool({
 
 pool.on("connect", () => console.log("Postgres connected"));
 
+// Simple UUID check (moved near top for reuse)
+function isUUID(v) {
+  return (
+    typeof v === "string" &&
+    /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/.test(
+      v
+    )
+  );
+}
+
 // --- DB Initialization ---
 async function initDb() {
   const client = await pool.connect();
@@ -93,6 +103,22 @@ async function initDb() {
         specialty TEXT,
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
+    `);
+
+    // Deduplicate track_requests before unique index (keep earliest)
+    await client.query(`
+      WITH ranked AS (
+        SELECT ctid, guardian_id, target_user_id,
+               ROW_NUMBER() OVER (PARTITION BY guardian_id,target_user_id ORDER BY created_at ASC) rn
+        FROM track_requests
+      )
+      DELETE FROM track_requests t
+      USING ranked r
+      WHERE t.ctid = r.ctid AND r.rn > 1;
+    `);
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS track_requests_guardian_target_unique
+        ON track_requests(guardian_id, target_user_id);
     `);
 
     await client.query(`
@@ -223,13 +249,16 @@ app.get("/location/mine", auth(), requireRole("user"), async (req, res) => {
   }
 });
 
-// 🔹 Guardian fetches last recorded location of a user
+// 🔹 Guardian fetches last recorded location of a user (add UUID validation)
 app.get(
   "/guardian/user-location/:userId",
   auth(),
   requireRole("guardian"),
   async (req, res) => {
     const targetUserId = req.params.userId;
+    if (!isUUID(targetUserId)) {
+      return res.status(400).json({ error: "invalid_user_id" });
+    }
 
     const access = await pool.query(
       "SELECT 1 FROM guardian_access WHERE guardian_id=$1 AND user_id=$2",
@@ -277,9 +306,9 @@ app.post(
   requireRole("guardian"),
   async (req, res) => {
     const { targetUserId, targetEmail } = req.body || {};
-    let resolvedTargetId = targetUserId || null;
+    let resolvedTargetId = null;
 
-    if (!resolvedTargetId && targetEmail) {
+    if (targetEmail) {
       const q = await pool.query(
         "SELECT id FROM users WHERE lower(email)=lower($1)",
         [targetEmail]
@@ -287,12 +316,20 @@ app.post(
       if (!q.rowCount)
         return res.status(404).json({ error: "target_not_found" });
       resolvedTargetId = q.rows[0].id;
-    }
-
-    if (!resolvedTargetId)
+    } else if (targetUserId) {
+      // Prevent passing a JWT token (or any non-uuid) in place of user id
+      if (!isUUID(targetUserId)) {
+        return res.status(400).json({
+          error: "invalid_target_user_id",
+          hint: "Provide a valid UUID in targetUserId or use targetEmail instead",
+        });
+      }
+      resolvedTargetId = targetUserId;
+    } else {
       return res
         .status(400)
         .json({ error: "provide targetUserId or targetEmail" });
+    }
 
     if (resolvedTargetId === req.user.id)
       return res.status(400).json({ error: "cannot_request_self" });
@@ -512,6 +549,107 @@ app.get("/resolve/guardian/:id", auth(), async (req, res) => {
   );
   if (!r.rowCount) return res.status(404).json({ error: "not_found" });
   res.json(r.rows[0]);
+});
+
+// --- Location ingestion alias (/locations) & latest/history retrieval ---
+
+// (Alias) Accept lat/lng or link
+app.post("/locations", auth(), requireRole("user"), async (req, res) => {
+  const { link, lat, lng, accuracy } = req.body || {};
+  if (!link && (typeof lat !== "number" || typeof lng !== "number")) {
+    return res.status(400).json({ error: "provide_link_or_lat_lng" });
+  }
+  try {
+    const r = await pool.query(
+      `INSERT INTO locations(user_id, link, lat, lng, accuracy)
+       VALUES($1,$2,$3,$4,$5)
+       RETURNING id, recorded_at`,
+      [
+        req.user.id,
+        link || null,
+        typeof lat === "number" ? lat : null,
+        typeof lng === "number" ? lng : null,
+        typeof accuracy === "number" ? accuracy : null,
+      ]
+    );
+    res
+      .status(201)
+      .json({ id: r.rows[0].id, recorded_at: r.rows[0].recorded_at });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "internal_error" });
+  }
+});
+
+// Latest location (user self or guardian with access)
+app.get("/locations/latest/:userId", auth(), async (req, res) => {
+  const targetUserId = req.params.userId;
+  if (!isUUID(targetUserId)) {
+    return res.status(400).json({ error: "invalid_user_id" });
+  }
+  // Permission: self or guardian_access or (future: ngo/admin)
+  if (req.user.id !== targetUserId) {
+    if (req.user.role === "guardian") {
+      const a = await pool.query(
+        "SELECT 1 FROM guardian_access WHERE guardian_id=$1 AND user_id=$2",
+        [req.user.id, targetUserId]
+      );
+      if (!a.rowCount) return res.status(403).json({ error: "forbidden" });
+    } else if (!["admin", "ngo"].includes(req.user.role)) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+  }
+  const r = await pool.query(
+    `SELECT id, link, lat, lng, accuracy, recorded_at
+       FROM locations
+      WHERE user_id=$1
+      ORDER BY recorded_at DESC
+      LIMIT 1`,
+    [targetUserId]
+  );
+  if (!r.rowCount) return res.status(404).json({ error: "no_location_found" });
+  res.json(r.rows[0]);
+});
+
+// Location history with optional time window
+app.get("/locations/history/:userId", auth(), async (req, res) => {
+  const targetUserId = req.params.userId;
+  if (!isUUID(targetUserId)) {
+    return res.status(400).json({ error: "invalid_user_id" });
+  }
+  // Permission logic same as latest
+  if (req.user.id !== targetUserId) {
+    if (req.user.role === "guardian") {
+      const a = await pool.query(
+        "SELECT 1 FROM guardian_access WHERE guardian_id=$1 AND user_id=$2",
+        [req.user.id, targetUserId]
+      );
+      if (!a.rowCount) return res.status(403).json({ error: "forbidden" });
+    } else if (!["admin", "ngo"].includes(req.user.role)) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+  }
+  const { from, to, limit = 100 } = req.query;
+  const params = [targetUserId];
+  let where = "user_id=$1";
+  if (from) {
+    params.push(new Date(from));
+    where += ` AND recorded_at >= $${params.length}`;
+  }
+  if (to) {
+    params.push(new Date(to));
+    where += ` AND recorded_at <= $${params.length}`;
+  }
+  params.push(Math.min(parseInt(limit, 10) || 100, 500));
+  const r = await pool.query(
+    `SELECT id, link, lat, lng, accuracy, recorded_at
+       FROM locations
+      WHERE ${where}
+      ORDER BY recorded_at DESC
+      LIMIT $${params.length}`,
+    params
+  );
+  res.json(r.rows);
 });
 
 // --- Start server ---
