@@ -291,6 +291,60 @@ app.get(
   }
 );
 
+// server.js (continuing from the previous code)
+
+// 🗄️ Add a "guardianId" to each request (already present above in guardian.id)
+let incomingRequests = [
+  {
+    id: "req1",
+    status: "pending",
+    created_at: new Date().toISOString(),
+    userId: "user_123", // user receiving the request
+    guardian: { id: "g_1", name: "Guardian", email: "guardian@example.com" },
+  },
+  {
+    id: "req2",
+    status: "approved",
+    created_at: new Date().toISOString(),
+    userId: "user_123",
+    guardian: { id: "g_1", name: "Guardian", email: "guardian@example.com" },
+  },
+  {
+    id: "req3",
+    status: "rejected",
+    created_at: new Date().toISOString(),
+    userId: "user_456",
+    guardian: { id: "g_2", name: "Guardian 2", email: "guardian2@example.com" },
+  },
+];
+
+// Dummy auth for guardians too
+function guardianAuth(req, res, next) {
+  const authHeader = req.headers["authorization"];
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  // In a real app decode token:
+  // req.guardianId = decoded.guardianId;
+  req.guardianId = "g_1"; // hardcoded for demo
+  next();
+}
+
+// 🔹 Guardian can view the status of the requests they sent
+app.get("/guardian/requests", guardianAuth, (req, res) => {
+  const myRequests = incomingRequests.filter(
+    (r) => r.guardian.id === req.guardianId
+  );
+  res.json(
+    myRequests.map((r) => ({
+      id: r.id,
+      status: r.status,
+      created_at: r.created_at,
+      user: { id: r.userId },
+    }))
+  );
+});
+
 // User approves/rejects a track request
 app.put(
   "/user/track-request/:id",
