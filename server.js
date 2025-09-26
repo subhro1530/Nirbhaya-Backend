@@ -421,6 +421,29 @@ app.get("/profile/me", auth(), async (req, res) => {
   res.json(profile);
 });
 
+// 🔹 Resolve email → user id and role
+app.get("/resolve/user", auth(), async (req, res) => {
+  // query param: ?email=user@example.com
+  const email = req.query.email;
+  const r = await pool.query(
+    "SELECT id, name, email, role FROM users WHERE email=$1",
+    [email]
+  );
+  if (!r.rowCount) return res.status(404).json({ error: "not_found" });
+  res.json(r.rows[0]); // {id, name, email, role}
+});
+
+// 🔹 Resolve guardian id → info (name/email)
+app.get("/resolve/guardian/:id", auth(), async (req, res) => {
+  const id = req.params.id;
+  const r = await pool.query(
+    "SELECT id, name, email FROM users WHERE id=$1 AND role='guardian'",
+    [id]
+  );
+  if (!r.rowCount) return res.status(404).json({ error: "not_found" });
+  res.json(r.rows[0]);
+});
+
 // --- Start server ---
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Server listening on ${port}`));
