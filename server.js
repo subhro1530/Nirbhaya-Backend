@@ -183,6 +183,50 @@ app.post("/auth/sign-in", async (req, res) => {
   });
 });
 
+
+// 🔹 Upload current location link (user)
+app.post("/location/upload", auth(), requireRole("user"), async (req, res) => {
+  try {
+    const { link } = req.body || {};
+    if (!link) {
+      return res.status(400).json({ error: "missing link" });
+    }
+
+    const r = await pool.query(
+      `INSERT INTO locations(user_id, link)
+       VALUES($1,$2)
+       RETURNING id, recorded_at`,
+      [req.user.id, link]
+    );
+
+    res.status(201).json({
+      id: r.rows[0].id,
+      recorded_at: r.rows[0].recorded_at,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "internal_error" });
+  }
+});
+
+// 🔹 List uploaded location links (user)
+app.get("/location/mine", auth(), requireRole("user"), async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT id, link, recorded_at
+         FROM locations
+        WHERE user_id=$1
+        ORDER BY recorded_at DESC`,
+      [req.user.id]
+    );
+    res.json(r.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "internal_error" });
+  }
+});
+
+
 // Lookup email → user ID for guardian
 app.get(
   "/users/lookup/email/:email",
@@ -433,6 +477,7 @@ app.get("/resolve/user", auth(), async (req, res) => {
   res.json(r.rows[0]); // {id, name, email, role}
 });
 
+// 🔹 Resolve guardian id → info (name/email)
 // 🔹 Resolve guardian id → info (name/email)
 app.get("/resolve/guardian/:id", auth(), async (req, res) => {
   const id = req.params.id;
