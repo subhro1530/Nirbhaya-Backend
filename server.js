@@ -226,6 +226,42 @@ app.get("/location/mine", auth(), requireRole("user"), async (req, res) => {
   }
 });
 
+// Guardian fetches a user's last recorded location
+app.get(
+  "/guardian/user-location/:userId",
+  auth(),
+  requireRole("guardian"),
+  async (req, res) => {
+    const targetUserId = req.params.userId;
+
+    // Check if guardian has access
+    const access = await pool.query(
+      "SELECT 1 FROM guardian_access WHERE guardian_id=$1 AND user_id=$2",
+      [req.user.id, targetUserId]
+    );
+    if (!access.rowCount) {
+      return res.status(403).json({ error: "no_access_to_user" });
+    }
+
+    // Fetch latest location
+    const location = await pool.query(
+      `SELECT id, lat, lng, accuracy, link, recorded_at
+         FROM locations
+        WHERE user_id=$1
+        ORDER BY recorded_at DESC
+        LIMIT 1`,
+      [targetUserId]
+    );
+
+    if (!location.rowCount) {
+      return res.status(404).json({ error: "no_location_found" });
+    }
+
+    res.json(location.rows[0]);
+  }
+);
+
+
 
 // Lookup email → user ID for guardian
 app.get(
