@@ -183,14 +183,11 @@ app.post("/auth/sign-in", async (req, res) => {
   });
 });
 
-
 // 🔹 Upload current location link (user)
 app.post("/location/upload", auth(), requireRole("user"), async (req, res) => {
   try {
     const { link } = req.body || {};
-    if (!link) {
-      return res.status(400).json({ error: "missing link" });
-    }
+    if (!link) return res.status(400).json({ error: "missing link" });
 
     const r = await pool.query(
       `INSERT INTO locations(user_id, link)
@@ -226,7 +223,7 @@ app.get("/location/mine", auth(), requireRole("user"), async (req, res) => {
   }
 });
 
-// Guardian fetches a user's last recorded location
+// 🔹 Guardian fetches last recorded location of a user
 app.get(
   "/guardian/user-location/:userId",
   auth(),
@@ -234,34 +231,28 @@ app.get(
   async (req, res) => {
     const targetUserId = req.params.userId;
 
-    // Check if guardian has access
     const access = await pool.query(
       "SELECT 1 FROM guardian_access WHERE guardian_id=$1 AND user_id=$2",
       [req.user.id, targetUserId]
     );
-    if (!access.rowCount) {
+    if (!access.rowCount)
       return res.status(403).json({ error: "no_access_to_user" });
-    }
 
-    // Fetch latest location
     const location = await pool.query(
       `SELECT id, lat, lng, accuracy, link, recorded_at
-         FROM locations
-        WHERE user_id=$1
-        ORDER BY recorded_at DESC
-        LIMIT 1`,
+       FROM locations
+       WHERE user_id=$1
+       ORDER BY recorded_at DESC
+       LIMIT 1`,
       [targetUserId]
     );
 
-    if (!location.rowCount) {
+    if (!location.rowCount)
       return res.status(404).json({ error: "no_location_found" });
-    }
 
     res.json(location.rows[0]);
   }
 );
-
-
 
 // Lookup email → user ID for guardian
 app.get(
@@ -503,17 +494,15 @@ app.get("/profile/me", auth(), async (req, res) => {
 
 // 🔹 Resolve email → user id and role
 app.get("/resolve/user", auth(), async (req, res) => {
-  // query param: ?email=user@example.com
   const email = req.query.email;
   const r = await pool.query(
     "SELECT id, name, email, role FROM users WHERE email=$1",
     [email]
   );
   if (!r.rowCount) return res.status(404).json({ error: "not_found" });
-  res.json(r.rows[0]); // {id, name, email, role}
+  res.json(r.rows[0]);
 });
 
-// 🔹 Resolve guardian id → info (name/email)
 // 🔹 Resolve guardian id → info (name/email)
 app.get("/resolve/guardian/:id", auth(), async (req, res) => {
   const id = req.params.id;
