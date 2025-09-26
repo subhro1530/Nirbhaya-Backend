@@ -16,7 +16,7 @@ app.use(compression());
 app.use(express.json({ limit: "512kb" }));
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
-// Postgres connection
+// --- Postgres connection ---
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl:
@@ -48,6 +48,15 @@ async function initDb() {
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
 
+      CREATE TABLE IF NOT EXISTS track_requests(
+        id UUID PRIMARY KEY,
+        guardian_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        target_user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','denied')),
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
       CREATE TABLE IF NOT EXISTS guardian_access(
         guardian_id UUID REFERENCES users(id) ON DELETE CASCADE,
         user_id UUID REFERENCES users(id) ON DELETE CASCADE,
@@ -64,15 +73,6 @@ async function initDb() {
         accuracy DOUBLE PRECISION,
         recorded_at TIMESTAMPTZ DEFAULT NOW(),
         link TEXT
-      );
-
-      CREATE TABLE IF NOT EXISTS track_requests(
-        id UUID PRIMARY KEY,
-        guardian_id UUID REFERENCES users(id) ON DELETE CASCADE,
-        target_user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-        status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','denied')),
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW()
       );
 
       CREATE TABLE IF NOT EXISTS sos(
@@ -95,7 +95,6 @@ async function initDb() {
       );
     `);
 
-    // safe alterations for upgrades
     await client.query(`
       ALTER TABLE guardian_access ADD COLUMN IF NOT EXISTS request_id UUID REFERENCES track_requests(id);
       ALTER TABLE track_requests ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
@@ -144,19 +143,6 @@ function requireRole(...roles) {
       return res.status(403).json({ error: "forbidden" });
     next();
   };
-}
-
-// --- Helper Functions ---
-async function canViewUser(requesterId, requesterRole, targetUserId) {
-  if (requesterRole === "admin" || requesterRole === "ngo") return true;
-  if (requesterRole === "guardian") {
-    const r = await pool.query(
-      "SELECT 1 FROM guardian_access WHERE guardian_id=$1 AND user_id=$2",
-      [requesterId, targetUserId]
-    );
-    return !!r.rowCount;
-  }
-  return requesterId === targetUserId;
 }
 
 // --- Routes ---
@@ -240,7 +226,6 @@ app.post(
     if (resolvedTargetId === req.user.id)
       return res.status(400).json({ error: "cannot_request_self" });
 
-    // Only one request ever
     const existing = await pool.query(
       "SELECT id,status FROM track_requests WHERE guardian_id=$1 AND target_user_id=$2 LIMIT 1",
       [req.user.id, resolvedTargetId]
@@ -291,60 +276,6 @@ app.get(
   }
 );
 
-// server.js (continuing from the previous code)
-
-// 🗄️ Add a "guardianId" to each request (already present above in guardian.id)
-let incomingRequests = [
-  {
-    id: "req1",
-    status: "pending",
-    created_at: new Date().toISOString(),
-    userId: "user_123", // user receiving the request
-    guardian: { id: "g_1", name: "Guardian", email: "guardian@example.com" },
-  },
-  {
-    id: "req2",
-    status: "approved",
-    created_at: new Date().toISOString(),
-    userId: "user_123",
-    guardian: { id: "g_1", name: "Guardian", email: "guardian@example.com" },
-  },
-  {
-    id: "req3",
-    status: "rejected",
-    created_at: new Date().toISOString(),
-    userId: "user_456",
-    guardian: { id: "g_2", name: "Guardian 2", email: "guardian2@example.com" },
-  },
-];
-
-// Dummy auth for guardians too
-function guardianAuth(req, res, next) {
-  const authHeader = req.headers["authorization"];
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-  // In a real app decode token:
-  // req.guardianId = decoded.guardianId;
-  req.guardianId = "g_1"; // hardcoded for demo
-  next();
-}
-
-// 🔹 Guardian can view the status of the requests they sent
-app.get("/guardian/requests", guardianAuth, (req, res) => {
-  const myRequests = incomingRequests.filter(
-    (r) => r.guardian.id === req.guardianId
-  );
-  res.json(
-    myRequests.map((r) => ({
-      id: r.id,
-      status: r.status,
-      created_at: r.created_at,
-      user: { id: r.userId },
-    }))
-  );
-});
-
 // User approves/rejects a track request
 app.put(
   "/user/track-request/:id",
@@ -376,9 +307,83 @@ app.put(
         "INSERT INTO guardian_access(guardian_id,user_id,request_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",
         [r.rows[0].guardian_id, req.user.id, requestId]
       );
+    } else {
+      await pool.query("DELETE FROM guardian_access WHERE request_id=$1", [
+        requestId,
+      ]);
     }
 
     res.json({ id: requestId, status: newStatus });
+  }
+);
+
+// Guardian can view status of requests they sent
+app.get(
+  "/guardian/requests",
+  auth(),
+  requireRole("guardian"),
+  async (req, res) => {
+    const r = await pool.query(
+      `SELECT tr.id, tr.status, tr.created_at, tr.updated_at,
+              tr.target_user_id AS user_id,
+              u.name AS user_name, u.email AS user_email
+         FROM track_requests tr
+         JOIN users u ON u.id = tr.target_user_id
+        WHERE tr.guardian_id = $1
+        ORDER BY tr.created_at DESC`,
+      [req.user.id]
+    );
+    res.json(
+      r.rows.map((row) => ({
+        id: row.id,
+        status: row.status,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        user: {
+          id: row.user_id,
+          name: row.user_name,
+          email: row.user_email,
+        },
+      }))
+    );
+  }
+);
+
+// Guardian cancels (deletes) a request
+app.delete(
+  "/guardian/track-request/:id",
+  auth(),
+  requireRole("guardian"),
+  async (req, res) => {
+    const requestId = req.params.id;
+    const r = await pool.query(
+      "SELECT * FROM track_requests WHERE id=$1 AND guardian_id=$2",
+      [requestId, req.user.id]
+    );
+    if (!r.rowCount)
+      return res.status(404).json({ error: "request_not_found" });
+
+    await pool.query("DELETE FROM track_requests WHERE id=$1", [requestId]);
+    await pool.query("DELETE FROM guardian_access WHERE request_id=$1", [
+      requestId,
+    ]);
+
+    res.json({ deleted: requestId });
+  }
+);
+
+// User revokes an already granted guardian access
+app.delete(
+  "/user/access/:guardianId",
+  auth(),
+  requireRole("user"),
+  async (req, res) => {
+    const guardianId = req.params.guardianId;
+    await pool.query(
+      "DELETE FROM guardian_access WHERE guardian_id=$1 AND user_id=$2",
+      [guardianId, req.user.id]
+    );
+    res.json({ revoked: guardianId });
   }
 );
 
@@ -416,6 +421,6 @@ app.get("/profile/me", auth(), async (req, res) => {
   res.json(profile);
 });
 
-// Start server
+// --- Start server ---
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Server listening on ${port}`));
